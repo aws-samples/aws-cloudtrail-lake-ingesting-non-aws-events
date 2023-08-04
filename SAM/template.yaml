@@ -1,0 +1,157 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  This template will deploy the resources required to ingest Google Cloud Audit Logs from a Google Pub/Sub subscription 
+  into CloudTrail Lake. This is done by creating a scheduled Lambda function which polls the subscription, parses and 
+  transforms audit events, and sends them to a CloudTrail Lake channel. Any events which were not ingested successfully
+  will be sent to an SQS FIFO queue.
+  
+  **WARNING** This template creates a Lambda function which will be automatically invoked on a recurring basis, as well
+  as other related resources. You will be billed for the AWS resources used if you create a stack from this template.
+
+Parameters:
+  CloudTrailEventDataStoreArn:
+    Type: String
+    Description: '[Optional] Arn of the event data store into which the Google Cloud Audit Logs will be ingested. If no Arn is provided, a new event data store will be created.'
+    Default: ''
+  CloudTrailEventRetentionPeriod:
+    Type: Number
+    Description: Number of days CloudTrail should retain events in the data store
+    MinValue: 7
+    MaxValue: 2557
+    Default: 7
+  GCPPubSubProjectName:
+    Type: String
+    Description: Name of the project associated with the GCP Pub/Sub topic
+  GCPPubSubSubscriptionName:
+    Type: String
+    Description: Name of the subscription associated with the GCP Pub/Sub topic
+  GCPCredentialsSecretName:
+    Type: String
+    Description: Name of the Secrets Manager secret which contains the GCP service account JSON keyfile content
+  MaxMessagesPerRead:
+    Type: Number
+    Description: Maximum number of messages to read when polling the GCP Pub/Sub subscription
+    Default: 500
+    MinValue: 1
+    MaxValue: 10000
+  ReadTimeout:
+    Type:  Number
+    Description: Maximum time in seconds to wait for messages when polling the GCP Pub/Sub subscription
+    Default: 10
+    MinValue: 1
+    MaxValue: 300
+  UserType:
+    Type: String
+    Description: The value that will be applied to the userIdentity.type field of each audit event ingested into CloudTrail Lake
+    Default: GoogleCloudUser
+
+Conditions:
+  CreateEventDataStore: !Equals [ !Ref CloudTrailEventDataStoreArn, '' ]
+
+Resources:
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  LambdaExecutionRolePolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+        PolicyName: 'GCPAuditEventsCTLake_Lambda_Role_Policy'
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - 'secretsmanager:GetSecretValue'
+              Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${GCPCredentialsSecretName}'
+            - Effect: Allow
+              Action:
+                - 'cloudtrail-data:PutAuditEvents'
+              Resource: !GetAtt CTLakeChannel.ChannelArn
+            - Effect: Allow
+              Action:
+                - 'sqs:SendMessage'
+              Resource: !GetAtt FailedIngestionEventQueue.Arn
+        Roles:
+          - !Ref LambdaExecutionRole
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${LambdaFunction}'
+      RetentionInDays: 7
+  LambdaFunction:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      CodeUri: ../source/lambda/
+      Handler: main.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      ReservedConcurrentExecutions: 3
+      Timeout: 300
+      Environment:
+        Variables:
+          GCP_CREDENTIALS: !Sub '{{resolve:secretsmanager:${GCPCredentialsSecretName}}}'
+          GCP_PROJECT_NAME: !Ref GCPPubSubProjectName
+          GCP_SUBSCRIPTION_NAME: !Ref GCPPubSubSubscriptionName
+          MAX_MESSAGES_PER_READ: !Ref MaxMessagesPerRead
+          GCP_SUBSCRIPTION_READ_TIMEOUT: !Ref ReadTimeout
+          DEFAULT_USER_TYPE: !Ref UserType
+          CLOUDTRAIL_LAKE_CHANNEL_ARN: !GetAtt CTLakeChannel.ChannelArn
+          FAILED_INGESTION_EVENTS_DLQ: !GetAtt FailedIngestionEventQueue.Arn
+  LambdaSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: ScheduledLambdaTrigger
+    DependsOn:
+      - CTLakeChannel
+      - LambdaLogGroup
+  LambdaSchedulePermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Sub ${LambdaFunction.Arn}
+      Principal: 'events.amazonaws.com'
+      SourceArn: !Sub ${LambdaSchedule.Arn}
+  NewCloudTrailEventDataStore:
+    Type: 'AWS::CloudTrail::EventDataStore'
+    Condition: CreateEventDataStore
+    Properties:
+      MultiRegionEnabled: False
+      OrganizationEnabled: False
+      RetentionPeriod: !Ref CloudTrailEventRetentionPeriod
+      AdvancedEventSelectors:
+       -
+        FieldSelectors:
+        - Field: eventCategory
+          Equals: [ 'ActivityAuditLog' ]
+      TerminationProtectionEnabled: False
+  CTLakeChannel:
+    Type: 'AWS::CloudTrail::Channel'
+    Properties:
+      Source: Custom
+      Destinations:
+        - Type: EVENT_DATA_STORE
+          Location: !If [ CreateEventDataStore, !Ref NewCloudTrailEventDataStore, !Ref CloudTrailEventDataStoreArn ]
+  FailedIngestionEventQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      FifoQueue: True
+
+Outputs:
+  EventDataStoreId:
+    Description: The Id of the CloudTrail Event Data Store which will be used when querying events in CloudTrail Lake.
+    Value: !If [ CreateEventDataStore, !Select [ 1, !Split [ '/', !Ref NewCloudTrailEventDataStore ] ], !Select [ 1, !Split [ '/', !Ref CloudTrailEventDataStoreArn ] ] ]
