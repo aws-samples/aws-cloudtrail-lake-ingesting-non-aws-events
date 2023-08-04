@@ -77,8 +77,8 @@ To use the SAM CLI and deploy this example, you need the following tools install
 
 1. Use git to clone this repository to your workspace area. SAM CLI should be configured with AWS credentials from the AWS account where you plan to deploy the example. Run the following commands in your shell:
 ```bash
-git clone https://github.com/aws-samples/ingesting-non-aws-resources-to-cloudtrail-lake.git
-cd ingesting-non-aws-resources-to-cloudtrail-lake/SAM
+git clone https://github.com/aws-samples/aws-cloudtrail-lake-ingesting-non-aws-events.git
+cd aws-cloudtrail-lake-ingesting-non-aws-events/SAM
 sam build
 sam deploy --guided
 ```
