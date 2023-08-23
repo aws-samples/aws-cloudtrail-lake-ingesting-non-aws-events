@@ -1,4 +1,4 @@
-# Ingesting Google Cloud Audit Logs to CloudTrail Lake
+# Ingesting activity events from non-AWS sources to AWS CloudTrail Lake
 
 
 ## Introduction
