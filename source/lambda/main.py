@@ -58,11 +58,7 @@ sqs_client = session.client('sqs')
 RECIPIENT_ACCOUNT_ID = sts_client.get_caller_identity()['Account']
 
 
-def transform_entry(entry: str) -> dict or None:
-    try:
-        entry = json.loads(entry)
-    except Exception as err:
-        raise err
+def transform_entry(entry: str) -> dict:
     logger.debug(f"Transforming entry: {entry}")
 
     # Skip if it's not a Google Cloud Audit Log type
@@ -130,6 +126,11 @@ def read_gcp_messages(subscriber: pubsub_v1.SubscriberClient) -> list:
     for received_message in response.received_messages:
         message_data_str = received_message.message.data.decode('utf-8')
         logger.debug(f"Received message from topic: {message_data_str}")
+        try:
+            message_data_str = json.loads(message_data_str)
+        except Exception as err:
+            logger.error(f"Failed to parse message: {err}")
+            continue
         messages.append({'ack_id': received_message.ack_id, 'message': message_data_str})
 
     logger.debug(f"Received {len(response.received_messages)} messages from {subscription_path}")
@@ -205,7 +206,7 @@ def lambda_handler(event, context) -> None:
         # Make a map of message ids to messages to reference later in the while loop
         message_dict = dict()
         for msg in messages:
-            msg_id = msg['message']['id']
+            msg_id = msg['message']['insertId']
             msg_event = msg['message']
             message_dict[msg_id] = msg_event
 
